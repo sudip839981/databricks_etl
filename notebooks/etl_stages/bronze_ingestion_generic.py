@@ -112,6 +112,7 @@ except json.JSONDecodeError as e:
 
 # COMMAND ----------
 
+import os # For os.path.exists
 source_df = None
 active_source_identifier_path = None # To store the path actually used, for audit logging source_file_name
 
@@ -149,28 +150,87 @@ if source_type == "ADLS_GEN2":
         if dataset_format.upper() == "CSV":
             # CSV specific options can also be in format_options (e.g., header, inferSchema, delimiter)
             # Default to inferSchema=True and header=True if not specified, common for bronze.
-            final_options = {"header": "true", "inferSchema": "true"}
+            final_options = {"header": "true", "inferSchema": "true", "mode": "PERMISSIVE", "columnNameOfCorruptRecord": "_corrupt_record_data"}
             final_options.update(format_options) # format_options from config can override defaults
             source_df = spark.read.format("csv").options(**final_options).load(full_adls_path)
         elif dataset_format.upper() == "JSON":
             # JSON specific options (e.g., multiline)
-            source_df = spark.read.format("json").options(**format_options).load(full_adls_path)
+            json_options = {"mode": "PERMISSIVE", "columnNameOfCorruptRecord": "_corrupt_record_data"}
+            json_options.update(format_options)
+            source_df = spark.read.format("json").options(**json_options).load(full_adls_path)
         elif dataset_format.upper() == "PARQUET":
             source_df = spark.read.format("parquet").options(**format_options).load(full_adls_path)
         elif dataset_format.upper() == "DELTA":
             source_df = spark.read.format("delta").options(**format_options).load(full_adls_path)
         # EXCEL will be handled in a separate block or requires pandas_on_spark / custom solution
         elif dataset_format.upper() == "EXCEL":
-            print(f"WARNING: EXCEL format from ADLS_GEN2 is specified. This basic template does not fully implement Excel reading. Requires additional libraries or logic (e.g. pandas integration or koalas). Placeholder for now.")
-            # Example using pandas if allowed and file is small enough for driver:
-            # if file_path: # pandas typically reads a single file
-            #    excel_bytes = dbutils.fs.head(full_adls_path, 1024*1024*10) # Limit size for head, or use direct pandas read if cluster has access.
-            #    pandas_df = pd.read_excel(io.BytesIO(excel_bytes), **format_options) # format_options for pandas: sheet_name, header etc.
-            #    source_df = spark.createDataFrame(pandas_df)
-            # else:
-            #    dbutils.notebook.exit("ERROR: EXCEL reading from a folder path is not supported in this basic template.")
-            dbutils.notebook.exit(f"ERROR: EXCEL format for ADLS_GEN2 requires specific implementation (e.g., using pandas or similar). DatasetID: {dataset_id}")
+            print(f"Attempting to read EXCEL format from ADLS Gen2 path: {full_adls_path}")
+            # Excel reading often requires pandas for flexibility (sheet_name, header, etc.)
+            # Ensure pandas is available. It's standard in Databricks runtimes.
+            import pandas as pd
+            import io
 
+            # Default pandas options for read_excel (can be overridden by format_options)
+            # None for sheet_name means read the first sheet. header=0 means first row is header.
+            pandas_read_options = {
+                "sheet_name": 0, # Default to first sheet if not specified
+                "header": 0      # Default to first row as header if not specified
+            }
+            if format_options:
+                # User-provided format_options can override defaults or add others like 'skiprows', 'usecols'
+                # Example: {"sheet_name": "Sheet2", "header": 0}
+                # Example: {"sheet_name": 0, "skiprows": 3, "usecols": "A:D"}
+                pandas_read_options.update(format_options)
+
+            try:
+                # For direct reading from ADLS with abfss paths, Spark's file system utilities
+                # can be used to get the file content if the cluster has appropriate permissions.
+                # This approach reads the file into memory on the driver, so suitable for moderately sized files.
+                # For very large Excel files, alternative strategies might be needed (e.g., pre-conversion).
+
+                if not file_path: # pandas read_excel typically works best with a single file path
+                    dbutils.notebook.exit(f"ERROR: For EXCEL format from ADLS_GEN2, 'file_path' must be specified in SourceIdentifier, not 'folder_path'. DatasetID: {dataset_id}")
+
+                # Read the file content using dbutils.fs.head() or by constructing a pandas-readable path
+                # Using direct path with fsspec-compatible libraries if available is often cleaner,
+                # but dbutils.fs.cp to local FS and then read is a common robust pattern if direct read is tricky.
+
+                # Let's try a common pattern: copy to a temporary local path.
+                # This requires the source path to be a single file.
+                temp_local_excel_path = f"/tmp/{dataset_id}_{active_source_identifier_path.split('/')[-1]}"
+                dbutils.fs.cp(full_adls_path, f"file:{temp_local_excel_path}") # Copy from abfss to local file API
+
+                print(f"Copied Excel file to temporary local path: {temp_local_excel_path} for pandas processing.")
+                print(f"Pandas read_excel options: {pandas_read_options}")
+
+                pandas_df = pd.read_excel(temp_local_excel_path, **pandas_read_options)
+
+                # Clean up the temporary local file
+                dbutils.fs.rm(f"file:{temp_local_excel_path}")
+
+                # Convert pandas DataFrame to Spark DataFrame
+                # Handle potential issues with schema inference if necessary (e.g. all-string types)
+                if pandas_df.empty:
+                    print(f"WARNING: Pandas DataFrame read from Excel file {full_adls_path} (sheet: {pandas_read_options.get('sheet_name')}) is empty.")
+                    # Create an empty Spark DataFrame with schema if possible, or exit/warn based on policy
+                    # For now, let Spark infer schema from empty df, which might lead to no columns.
+                    # Consider defining schema from BronzeLayerSchema config if available and df is empty.
+                    source_df = spark.createDataFrame(pandas_df)
+                else:
+                    source_df = spark.createDataFrame(pandas_df)
+
+                print(f"Successfully read Excel file {full_adls_path} using pandas and converted to Spark DataFrame.")
+
+            except Exception as e_excel:
+                # Ensure temporary file is cleaned up even if pandas read fails
+                if 'temp_local_excel_path' in locals() and os.path.exists(temp_local_excel_path.replace("file:","")): # check local path for os.exists
+                    try:
+                        dbutils.fs.rm(f"file:{temp_local_excel_path}")
+                    except Exception as e_cleanup:
+                        print(f"WARNING: Failed to clean up temporary local Excel file {temp_local_excel_path}: {e_cleanup}")
+
+                print(f"ERROR: Failed to read or process EXCEL file {full_adls_path}. DatasetID: {dataset_id}. Error: {e_excel}")
+                raise e_excel # Re-raise the exception to fail the notebook.
         else:
             dbutils.notebook.exit(f"ERROR: Unsupported DatasetFormat '{dataset_format}' for SourceType 'ADLS_GEN2'. DatasetID: {dataset_id}")
 
@@ -253,6 +313,115 @@ if source_df is None:
 print("Data read successfully from source.")
 source_df.printSchema()
 # source_df.show(5, truncate=False) # Uncomment for debugging
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 2.1 Handle Corrupt Records (if applicable)
+# MAGIC
+# MAGIC For sources like CSV/JSON read in PERMISSIVE mode, check for and quarantine corrupt records.
+
+# COMMAND ----------
+
+corrupt_record_column_name = "_corrupt_record_data" # Must match what was used in reader options
+
+if corrupt_record_column_name in source_df.columns:
+    print(f"Checking for corrupt records in column: {corrupt_record_column_name}")
+
+    corrupt_records_df = source_df.where(col(corrupt_record_column_name).isNotNull())
+    good_records_df = source_df.where(col(corrupt_record_column_name).isNull())
+
+    if not corrupt_records_df.rdd.isEmpty(): # isEmpty() is more robust for checking if a DataFrame has data
+        print(f"Found corrupt records for DatasetID: {dataset_id}")
+
+        # Define quarantine table name (can be made more configurable later)
+        quarantine_table_name_suffix = dataset_config.DatasetName.lower().replace(' ', '_').replace('-', '_')
+        quarantine_table_full_name = f"{bronze_catalog}.{bronze_schema}.brz_quarantined_{quarantine_table_name_suffix}"
+
+        print(f"Writing corrupt records to: {quarantine_table_full_name}")
+
+        # Select necessary fields for quarantine. Add source reference for traceability.
+        source_ref_for_quarantine = "unknown_source" # Default value
+        if source_type == "ADLS_GEN2" and 'active_source_identifier_path' in locals() and active_source_identifier_path:
+            source_ref_for_quarantine = active_source_identifier_path
+        elif source_type == "SQL_SERVER":
+            # Check if custom_query or table_or_view_name are in scope from the SQL_SERVER block
+            # These might not be if this cell is run independently or if SQL_SERVER block wasn't executed
+            current_custom_query = source_identifier.get("query") # Re-fetch from source_identifier for safety
+            current_table_or_view_name = source_identifier.get("table_or_view_name")
+            current_db_schema_name = source_identifier.get("schema_name", "dbo")
+
+            if current_custom_query:
+                source_ref_for_quarantine = f"sql_query(datasource:{datasource_config.SourceName})"
+            elif current_table_or_view_name:
+                source_ref_for_quarantine = f"sql_table:{current_db_schema_name}.{current_table_or_view_name}"
+
+
+        quarantined_data_to_write = corrupt_records_df.select(
+            lit(dataset_id).alias("DatasetID"),
+            lit(source_ref_for_quarantine).alias("SourceReference"),
+            col(corrupt_record_column_name).alias("CorruptRecordData"),
+            current_timestamp().alias("LoadTimestamp")
+        )
+
+        try:
+            # Ensure target quarantine schema (same as bronze schema for now) exists
+            spark.sql(f"CREATE SCHEMA IF NOT EXISTS {bronze_catalog}.{bronze_schema}")
+
+            quarantined_data_to_write.write.format("delta").mode("append").saveAsTable(quarantine_table_full_name)
+
+            # Re-count after write attempt for accurate logging if needed, or use value from a more direct count action
+            # For now, this count is before write, if write fails, count is still of attempt.
+            # corrupt_count = quarantined_data_to_write.count() # This would be another job
+            # print(f"Successfully wrote {corrupt_count} corrupt records to {quarantine_table_full_name}")
+            # To avoid extra job for count, we can assume if no exception, all rows in quarantined_data_to_write were written.
+            # A more robust way if count is critical, is to count before write.
+
+            # The corrupt_records_df.rdd.isEmpty() check implies there are rows if false.
+            # A direct count before write is safer if exact number is needed for logging here.
+            num_corrupt_records = corrupt_records_df.count() # Get count for logging
+            print(f"Successfully wrote {num_corrupt_records} corrupt records to {quarantine_table_full_name}")
+
+        except Exception as e_quarantine:
+            print(f"ERROR: Failed to write corrupt records to {quarantine_table_full_name}. Error: {e_quarantine}")
+            # Decide if this should be a fatal error for the whole job. For now, log and continue with good records.
+            # Consider adding a notification here.
+
+        # Update source_df to only contain good records
+        source_df = good_records_df.drop(corrupt_record_column_name) # Drop the now-empty corrupt record column
+        print("Proceeding with good records.")
+    else:
+        print("No corrupt records found.")
+        if corrupt_record_column_name in source_df.columns: # Ensure column is dropped if it exists but all were null
+            source_df = source_df.drop(corrupt_record_column_name)
+
+else:
+    print(f"Corrupt record column '{corrupt_record_column_name}' not found in DataFrame. Skipping corrupt record check (may not be applicable for this source type/format or options).")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 2.2 Check for Empty Source Data
+# MAGIC
+# MAGIC After attempting to read and handle corrupt records, check if the resulting DataFrame is empty.
+
+# COMMAND ----------
+
+if source_df.isEmpty():
+    print(f"WARNING: Source data for DatasetID '{dataset_id}' (Source Type: '{source_type}', Format: '{dataset_format}') is empty after all read attempts and corrupt record handling.")
+    # Depending on desired policy, you might:
+    # 1. Continue processing (writes an empty table to Bronze) - Current implicit behavior.
+    # 2. Exit gracefully: dbutils.notebook.exit(f"INFO: Source for DatasetID '{dataset_id}' is empty. No data to process.")
+    # 3. Make this configurable via a setting in the Datasets table.
+    # For now, we will just log the warning and allow the process to continue, which will result in an empty table if it's an initial load,
+    # or no change if appending (though Bronze is usually overwrite).
+    # This ensures the Bronze table is created even if the first load is empty, which can be useful for downstream dependencies.
+
+    # No specific action to stop processing is taken here, allowing an empty DataFrame to proceed.
+    # Audit columns will still be added, and an empty table will be written.
+    pass # Explicitly noting that we are allowing empty DF to proceed.
+else:
+    print("Source DataFrame is not empty. Proceeding with audit column addition.")
 
 # COMMAND ----------
 
